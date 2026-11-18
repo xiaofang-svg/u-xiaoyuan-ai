@@ -1,0 +1,2134 @@
+// ==UserScript==
+// @name         U校园 AI 答题助手（Groq版）
+// @namespace    https://tampermonkey.net/
+// @version      2.3.1
+// @description  提取 U校园当前题目并调用 Groq AI 生成答案：题型识别、自动填入、自动提交、自动继续、连续答题、暂停程序、iframe 穿透、超时重试、本地缓存、Key 本地保存
+// @author       you
+// @match        *://*.unipus.cn/*
+// @match        *://u.unipus.cn/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.groq.com
+// @run-at       document-idle
+// @license MIT
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    if (window.__UCAMPUS_AI_HELPER_V2__) return;
+    window.__UCAMPUS_AI_HELPER_V2__ = true;
+
+    /* =====================================================================
+     * 1. 配置
+     * =================================================================== */
+    const CFG = {
+        apiUrl: 'https://api.groq.com/openai/v1/chat/completions',
+        models: [
+            'openai/gpt-oss-120b',
+            'openai/gpt-oss-20b'
+        ],
+        defaultModel: 'openai/gpt-oss-120b',
+        temperature: 0.2,
+        timeoutMs: 60000,
+        maxQuestionChars: 2500,
+        cacheLimit: 30,
+        frameWaitMs: 500,
+        KEY_STORE: 'uc_groq_api_key',
+        MODEL_STORE: 'uc_groq_model',
+        POS_STORE: 'uc_ai_panel_pos',
+        AUTOFILL_STORE: 'uc_ai_autofill',
+    };
+
+    const IS_TOP = (() => {
+        try {
+            return window.top === window.self;
+        } catch (e) {
+            return false;
+        }
+    })();
+
+    /* =====================================================================
+     * 2. 存储与通用工具
+     * =================================================================== */
+    const store = {
+        get(key, def) {
+            try {
+                if (typeof GM_getValue === 'function') {
+                    const v = GM_getValue(key, null);
+                    return v === null || v === undefined ? def : v;
+                }
+                const raw = localStorage.getItem(key);
+                return raw === null ? def : JSON.parse(raw);
+            } catch (e) {
+                return def;
+            }
+        },
+
+        set(key, val) {
+            try {
+                if (typeof GM_setValue === 'function') {
+                    return GM_setValue(key, val);
+                }
+                localStorage.setItem(key, JSON.stringify(val));
+            } catch (e) {
+                // 忽略异常
+            }
+        },
+    };
+
+    const getKey = () =>
+        String(store.get(CFG.KEY_STORE, '') || '').trim();
+
+    const getModel = () => {
+        const m = String(
+            store.get(CFG.MODEL_STORE, CFG.defaultModel) || ''
+        );
+        return CFG.models.indexOf(m) >= 0 ? m : CFG.defaultModel;
+    };
+
+    const $all = (sel, root) =>
+        Array.prototype.slice.call(
+            (root || document).querySelectorAll(sel)
+        );
+
+    function cleanText(t) {
+        return String(t || '')
+            .replace(/\u00a0/g, ' ')
+            .replace(/[ \t]+$/gm, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    function isVisible(el) {
+        if (!el || el.nodeType !== 1) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        const cs = getComputedStyle(el);
+        if (
+            cs.display === 'none' ||
+            cs.visibility === 'hidden' ||
+            cs.opacity === '0'
+        ) return false;
+        return !el.closest('[hidden],[aria-hidden="true"]');
+    }
+
+    function inViewport(el) {
+        const r = el.getBoundingClientRect();
+        const vw = window.innerWidth || 0;
+        const vh = window.innerHeight || 0;
+        return (
+            r.bottom > 0 &&
+            r.top < vh &&
+            r.right > 0 &&
+            r.left < vw
+        );
+    }
+
+    function hash(str) {
+        let h = 5381;
+        for (let i = 0; i < str.length; i++) {
+            h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+        }
+        return (h >>> 0).toString(36);
+    }
+
+    /* =====================================================================
+     * 3. 题目提取
+     * =================================================================== */
+
+    const NOISE_LINE = new RegExp(
+        '^(' +
+        '查看解析|收起解析|解析|答案解析|答案|正确答案|我的答案|' +
+        '提交答案|保存并提交|提交|确定|取消|关闭|' +
+        '下一题|上一题|返回|答题卡|收藏|纠错|分享|全屏|' +
+        '重新作答|重做|跳过|开始答题|继续答题|' +
+        '提示|帮助|题目来源|来源|单元测试|随堂测试|' +
+        '剩余时间.*|用时.*|已用时.*|音频|视频|播放|暂停|重播|字幕|' +
+        '输入答案|请输入.*' +
+        ')$'
+    );
+
+    const BLOCK_SELECTORS = [
+        '[class*="question-item"]',
+        '[class*="questionItem"]',
+        '[class*="question-wrap"]',
+        '[class*="questionWrap"]',
+        '[class*="question-content"]',
+        '[class*="questionContent"]',
+        '[class*="question-container"]',
+        '[class*="stem"]',
+        '[class*="subject-"]',
+        '.question',
+        '.que-item',
+    ];
+
+    function collectCandidates() {
+        const map = new Map();
+
+        const push = (el, weight) => {
+            if (!el || el.nodeType !== 1) return;
+            if (!isVisible(el) || !inViewport(el)) return;
+
+            const text = cleanText(el.innerText);
+            if (text.length < 8 || text.length > 8000) return;
+
+            const prev = map.get(el);
+            if (prev) {
+                prev.weight = Math.max(prev.weight, weight);
+            } else {
+                map.set(el, { el, text, weight });
+            }
+        };
+
+        BLOCK_SELECTORS.forEach((sel, idx) => {
+            const w = 1 + (BLOCK_SELECTORS.length - idx) * 0.05;
+            try {
+                $all(sel).forEach(el => push(el, w));
+            } catch (e) {}
+        });
+
+        if (!map.size) {
+            try {
+                const el = document.elementFromPoint(
+                    (window.innerWidth || 0) / 2,
+                    (window.innerHeight || 0) / 2
+                );
+                if (el) {
+                    push(
+                        el.closest('div,section,li,article') || el,
+                        0.6
+                    );
+                }
+            } catch (e) {}
+        }
+
+        return Array.from(map.values());
+    }
+
+    function scoreCandidate(cand) {
+        const el = cand.el;
+        const text = cand.text;
+        let s = 0;
+
+        s += Math.min(text.length, 1500) / 60;
+        if (text.length > 4000) s -= 4;
+
+        const controls = el.querySelectorAll(
+            'input[type=radio],input[type=checkbox],textarea,input[type=text]'
+        );
+        s += Math.min(controls.length, 8) * 0.9;
+
+        if (/^[A-D][.．、)\s]/m.test(text)) s += 1.4;
+        if (/_{2,}|（\s*）|\(\s*\)/.test(text)) s += 1.0;
+        if (/翻译|作文|writing|translate/i.test(text)) s += 0.4;
+
+        const r = el.getBoundingClientRect();
+        const vh = window.innerHeight || 1;
+        const centerDelta =
+            Math.abs((r.top + r.bottom) / 2 - vh / 2) / vh;
+
+        s += 1 - Math.min(centerDelta, 1);
+        return s * cand.weight;
+    }
+
+    function analyze(el, rawText) {
+        const optInputs = $all(
+            'input[type=radio],input[type=checkbox]',
+            el
+        );
+
+        const hasChoice =
+            optInputs.length >= 2 && optInputs.length <= 8;
+
+        const isMulti =
+            hasChoice && optInputs.some(i => i.type === 'checkbox');
+
+        const options = [];
+
+        if (hasChoice) {
+            const seen = new Set();
+            optInputs.forEach(inp => {
+                const holder =
+                    inp.closest(
+                        'label,li,[class*="option"],[class*="choice"],p'
+                    ) || inp.parentElement;
+
+                const t = holder
+                    ? cleanText(holder.innerText).split('\n')[0]
+                    : '';
+
+                if (t && t.length <= 120 && !seen.has(t)) {
+                    seen.add(t);
+                    options.push(t);
+                }
+            });
+        }
+
+        const checked = hasChoice
+            ? optInputs
+                .filter(i => i.checked)
+                .map(i => {
+                    const h =
+                        i.closest(
+                            'label,li,[class*="option"],[class*="choice"]'
+                        ) || i.parentElement;
+                    return h
+                        ? cleanText(h.innerText).split('\n')[0]
+                        : '';
+                })
+                .filter(Boolean)
+            : [];
+
+        const blankByText =
+            (rawText.match(/_{2,}/g) || []).length;
+
+        const blankByInput = el.querySelectorAll(
+            'input[type=text],input:not([type]),textarea'
+        ).length;
+
+        const blanks = Math.max(blankByText, blankByInput, 0);
+        const seenShort = new Set();
+
+        const lines = cleanText(rawText)
+            .split('\n')
+            .map(s => s.trim())
+            .filter(Boolean)
+            .filter(s => !NOISE_LINE.test(s))
+            .filter(s => {
+                if (s.length > 6) return true;
+                if (seenShort.has(s)) return false;
+                seenShort.add(s);
+                return true;
+            });
+
+        let text = lines.join('\n');
+
+        if (options.length >= 2) {
+            const letters = 'ABCDEFGH';
+            const norm = s =>
+                s.replace(/^\s*[A-Ha-h]\s*[.．、)]\s*/, '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+
+            const optSet = new Set(options.map(norm));
+
+            text = text
+                .split('\n')
+                .filter(
+                    line =>
+                        !optSet.has(norm(line)) &&
+                        !optSet.has(line.trim())
+                )
+                .join('\n');
+
+            const optionBlock = options
+                .map((t, i) => {
+                    const stripped = t.replace(
+                        /^\s*([A-Ha-h])\s*[.．、)]\s*/,
+                        (m, g) => g.toUpperCase() + '. '
+                    );
+                    return /^[A-H]\.\s/.test(stripped)
+                        ? stripped
+                        : letters[i] + '. ' + t;
+                })
+                .join('\n');
+
+            text = (text ? text + '\n' : '') + optionBlock;
+        }
+
+        text = text.slice(0, CFG.maxQuestionChars);
+
+        let type = 'translate';
+
+        if (isMulti) {
+            type = 'multiple';
+        } else if (options.length >= 2) {
+            type = 'single';
+        } else if (blanks > 0) {
+            type = 'blank';
+        } else if (/翻译|translate|写作|作文|writing|composition/i.test(text)) {
+            type = 'translate';
+        } else if (/判断|对错|true|false/i.test(text)) {
+            type = 'judge';
+        }
+
+        return {
+            text,
+            type,
+            options,
+            blanks,
+            checked,
+            score: 0,
+        };
+    }
+
+    function bestFromDOM() {
+        const cands = collectCandidates().map(c => {
+            const info = analyze(c.el, c.text);
+            info.score =
+                scoreCandidate(c) +
+                (info.type !== 'translate' ? 0.5 : 0);
+            info.el = c.el;
+            return info;
+        });
+
+        cands.sort((a, b) => b.score - a.score);
+        return cands.length ? cands[0] : null;
+    }
+
+    /* =====================================================================
+     * 4. 跨 iframe 取题
+     * =================================================================== */
+
+    function packQuestion(info) {
+        if (!info) return null;
+        return {
+            text: info.text,
+            type: info.type,
+            options: info.options,
+            blanks: info.blanks,
+            checked: info.checked,
+            score: info.score,
+        };
+    }
+
+    function installFrameAgent() {
+        let lastTarget = null;
+
+        window.addEventListener('message', ev => {
+            const d = ev.data;
+            if (!d || !d.__ucAI) return;
+
+            if (d.__ucAI === 'reply' || d.__ucAI === 'filled') {
+                try {
+                    if (window.parent && window.parent !== window) {
+                        window.parent.postMessage(d, '*');
+                    }
+                } catch (e) {}
+                return;
+            }
+
+            if (d.__ucAI === 'ask') {
+                let best = null;
+                try {
+                    best = bestFromDOM();
+                } catch (e) {
+                    best = null;
+                }
+
+                if (best) {
+                    lastTarget = {
+                        info: best,
+                        el: best.el,
+                        at: Date.now()
+                    };
+                }
+
+                try {
+                    if (ev.source) {
+                        ev.source.postMessage({
+                            __ucAI: 'reply',
+                            id: d.id,
+                            question: packQuestion(best)
+                        }, '*');
+                    }
+                } catch (e) {}
+                return;
+            }
+
+            if (d.__ucAI === 'fill') {
+                let res = null;
+
+                try {
+                    let target =
+                        lastTarget &&
+                        Date.now() - lastTarget.at < 60000
+                            ? lastTarget
+                            : null;
+
+                    if (!target || !target.el) {
+                        const fresh = bestFromDOM();
+                        if (fresh) {
+                            target = {
+                                info: fresh,
+                                el: fresh.el,
+                                at: Date.now()
+                            };
+                        }
+                    }
+
+                    res = target
+                        ? fillAnswer(target.info, target.el, d.answer)
+                        : {
+                            filled: 0,
+                            total: 0,
+                            note: '找不到题目'
+                        };
+                } catch (e) {
+                    res = {
+                        filled: 0,
+                        total: 0,
+                        note: '填入时出错'
+                    };
+                }
+
+                try {
+                    if (ev.source) {
+                        ev.source.postMessage({
+                            __ucAI: 'filled',
+                            id: d.id,
+                            result: res
+                        }, '*');
+                    }
+                } catch (e) {}
+            }
+        }, false);
+    }
+
+    function askFrames(timeoutMs) {
+        const frames = $all('iframe,frame');
+        if (!frames.length) return Promise.resolve([]);
+
+        return new Promise(resolve => {
+            const id =
+                'q' +
+                Date.now().toString(36) +
+                Math.random().toString(36).slice(2, 7);
+
+            const found = [];
+
+            const onMsg = ev => {
+                const d = ev.data;
+                if (
+                    !d ||
+                    d.__ucAI !== 'reply' ||
+                    d.id !== id ||
+                    !d.question
+                ) return;
+
+                let srcFrame = null;
+                try {
+                    srcFrame = frames.find(f => {
+                        try {
+                            return f.contentWindow === ev.source;
+                        } catch (e) {
+                            return false;
+                        }
+                    }) || null;
+                } catch (e) {
+                    srcFrame = null;
+                }
+
+                d.question._frame = srcFrame;
+                found.push(d.question);
+            };
+
+            window.addEventListener('message', onMsg, false);
+
+            frames.forEach(f => {
+                try {
+                    f.contentWindow.postMessage({
+                        __ucAI: 'ask',
+                        id
+                    }, '*');
+                } catch (e) {}
+            });
+
+            setTimeout(() => {
+                window.removeEventListener('message', onMsg, false);
+                resolve(found);
+            }, timeoutMs);
+        });
+    }
+
+    async function extractQuestion() {
+        const local = bestFromDOM();
+        if (local && local.score >= 3) return local;
+
+        const remote = await askFrames(CFG.frameWaitMs);
+        const all = (local ? [local] : []).concat(remote);
+        if (!all.length) return null;
+
+        all.sort((a, b) => (b.score || 0) - (a.score || 0));
+        return all[0];
+    }
+
+    function fillInFrame(frameEl, answer, timeoutMs) {
+        return new Promise(resolve => {
+            const id =
+                'f' +
+                Date.now().toString(36) +
+                Math.random().toString(36).slice(2, 6);
+
+            let timer = null;
+
+            const cleanup = () => {
+                if (timer) clearTimeout(timer);
+                window.removeEventListener('message', onMsg, false);
+            };
+
+            const onMsg = ev => {
+                const d = ev.data;
+                if (
+                    !d ||
+                    d.__ucAI !== 'filled' ||
+                    d.id !== id
+                ) return;
+
+                cleanup();
+                resolve(d.result || null);
+            };
+
+            window.addEventListener('message', onMsg, false);
+
+            timer = setTimeout(() => {
+                cleanup();
+                resolve(null);
+            }, timeoutMs || 3000);
+
+            try {
+                frameEl.contentWindow.postMessage({
+                    __ucAI: 'fill',
+                    id,
+                    answer
+                }, '*');
+            } catch (e) {
+                cleanup();
+                resolve(null);
+            }
+        });
+    }
+
+    async function applyAnswer(q, answer) {
+        const empty = {
+            filled: 0,
+            total: 0,
+            note: '没有可填写的题目'
+        };
+
+        if (!q) return empty;
+
+        if (q._frame) {
+            const r = await fillInFrame(q._frame, answer, 3000);
+            return r || {
+                filled: 0,
+                total: 0,
+                note: 'iframe 内填入超时'
+            };
+        }
+
+        let el = q.el;
+
+        if (!el || !document.contains(el)) {
+            const fresh = bestFromDOM();
+            if (!fresh) {
+                return {
+                    filled: 0,
+                    total: 0,
+                    note: '题目已失效，请重新取题'
+                };
+            }
+            el = fresh.el;
+            q = fresh;
+        }
+
+        return fillAnswer(q, el, answer);
+    }
+
+    /* =====================================================================
+     * 5. 提示词
+     * =================================================================== */
+
+    function buildMessages(q) {
+        const sys =
+            '你是一位经验丰富的大学英语教师，也是严格的阅卷人。' +
+            '你只输出可以直接填写或勾选的答案，绝不输出题目复述、解析或客套话。' +
+            '如果题目信息不足以作答，只输出四个字：信息不足。';
+
+        const rules = {
+            single:
+                '题型：单选题。只输出一个选项字母（例如 B），不要输出其他任何字符。',
+            multiple:
+                '题型：多选题。按字母升序输出全部正确选项字母（例如 ABD），不要输出其他内容。',
+            judge:
+                '题型：判断题。只输出「对」或「错」。',
+            blank:
+                '题型：填空题，共 ' +
+                (q.blanks || 1) +
+                ' 个空。按空格在题目中出现的顺序输出，' +
+                '每行只写一个空的答案，不要编号、不要解释；单词保持题目要求的形态，不加句号。',
+            translate:
+                '题型：翻译或写作。直接给出完整译文或作文正文，不要复述题目，不要解释，不要加引号。',
+        };
+
+        let user = rules[q.type] || rules.translate;
+
+        if (q.checked && q.checked.length) {
+            user +=
+                '\n（页面当前已选：' +
+                q.checked.join('；') +
+                '，可供参考，但请独立判断。）';
+        }
+
+        user += '\n\n===== 题目原文 =====\n' + q.text;
+
+        return [
+            { role: 'system', content: sys },
+            { role: 'user', content: user },
+        ];
+    }
+
+    function cleanAnswer(raw) {
+        return String(raw || '')
+            .replace(/^\s*```[a-zA-Z]*\s*/, '')
+            .replace(/\s*```\s*$/, '')
+            .replace(/^\s*(参考答案|正确答案|答案|Answer)\s*[:：]\s*/i, '')
+            .replace(/[ \t]+$/gm, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+    }
+
+    /* =====================================================================
+     * 6. 网络请求（Groq API）
+     * =================================================================== */
+
+    const cache = new Map();
+
+    function httpMessage(status) {
+        const map = {
+            400: '请求参数错误，请检查模型名称和请求参数',
+            401: 'Groq API Key 无效，请重新填写',
+            402: '账户额度不足，请检查 Groq 账户',
+            403: '访问被拒绝，请检查 API 权限',
+            404: '模型不存在，请更换模型',
+            422: '请求参数校验失败',
+            429: 'Groq 请求次数达到限制，请稍后重试',
+            500: 'Groq 服务端错误，请稍后重试',
+            502: 'Groq 网关错误，请稍后重试',
+            503: 'Groq 服务繁忙，请稍后重试',
+        };
+        return map[status] || ('请求失败（HTTP ' + status + '）');
+    }
+
+    function requestAnswer(payload) {
+        const key = getKey();
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + key,
+        };
+        const body = JSON.stringify(payload);
+
+        return new Promise((resolve, reject) => {
+            const fail = (msg, code) => {
+                const err = new Error(msg);
+                err.code = code;
+                reject(err);
+            };
+
+            if (typeof GM_xmlhttpRequest === 'function') {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: CFG.apiUrl,
+                    headers,
+                    data: body,
+                    timeout: CFG.timeoutMs,
+
+                    onload: res => {
+                        if (res.status === 200) {
+                            try {
+                                const json = JSON.parse(res.responseText);
+                                const msg =
+                                    json &&
+                                    json.choices &&
+                                    json.choices[0] &&
+                                    json.choices[0].message;
+                                resolve(cleanAnswer(msg && msg.content));
+                            } catch (e) {
+                                fail('返回内容解析失败', 'parse');
+                            }
+                        } else if (res.status === 0) {
+                            fail('网络请求失败，请检查网络或代理', 'network');
+                        } else {
+                            console.warn(
+                                '[U校园AI] HTTP',
+                                res.status,
+                                String(res.responseText).slice(0, 300)
+                            );
+                            fail(httpMessage(res.status), res.status);
+                        }
+                    },
+
+                    onerror: () => {
+                        fail('网络请求失败，请检查网络或代理', 'network');
+                    },
+                    ontimeout: () => {
+                        fail('请求超时，请重试', 'timeout');
+                    },
+                    onabort: () => {
+                        fail('请求已取消', 'abort');
+                    },
+                });
+                return;
+            }
+
+            const ctrl =
+                typeof AbortController === 'function'
+                    ? new AbortController()
+                    : null;
+
+            const timer = ctrl
+                ? setTimeout(() => ctrl.abort(), CFG.timeoutMs)
+                : null;
+
+            fetch(CFG.apiUrl, {
+                method: 'POST',
+                headers,
+                body,
+                signal: ctrl ? ctrl.signal : undefined,
+            })
+                .then(res =>
+                    res.text().then(txt => ({
+                        ok: res.ok,
+                        status: res.status,
+                        txt
+                    }))
+                )
+                .then(r => {
+                    if (timer) clearTimeout(timer);
+                    if (!r.ok) {
+                        return fail(httpMessage(r.status), r.status);
+                    }
+
+                    try {
+                        const json = JSON.parse(r.txt);
+                        const msg =
+                            json &&
+                            json.choices &&
+                            json.choices[0] &&
+                            json.choices[0].message;
+                        resolve(cleanAnswer(msg && msg.content));
+                    } catch (e) {
+                        fail('返回内容解析失败', 'parse');
+                    }
+                })
+                .catch(e => {
+                    if (timer) clearTimeout(timer);
+                    fail(
+                        e && e.name === 'AbortError'
+                            ? '请求超时，请重试'
+                            : '网络请求失败，请检查网络',
+                        'network'
+                    );
+                });
+        });
+    }
+
+    async function askWithRetry(payload) {
+        try {
+            return await requestAnswer(payload);
+        } catch (e) {
+            const retryable =
+                e.code === 429 ||
+                e.code === 500 ||
+                e.code === 502 ||
+                e.code === 503 ||
+                e.code === 'network';
+
+            if (!retryable) throw e;
+            await new Promise(r => setTimeout(r, 1200));
+            return requestAnswer(payload);
+        }
+    }
+
+    async function getAnswer(q) {
+        const payload = {
+            model: getModel(),
+            messages: buildMessages(q),
+            temperature: CFG.temperature,
+            stream: false,
+        };
+
+        const ck = hash(
+            payload.model + '|' + q.type + '|' + q.text
+        );
+
+        if (cache.has(ck)) return cache.get(ck);
+
+        const answer = await askWithRetry(payload);
+        cache.set(ck, answer);
+
+        if (cache.size > CFG.cacheLimit) {
+            const first = cache.keys().next().value;
+            cache.delete(first);
+        }
+
+        return answer;
+    }
+
+    /* =====================================================================
+     * 6.5 自动填入
+     * =================================================================== */
+
+    function lettersToIndexes(rawAnswer, count) {
+        const ans = String(rawAnswer || '').trim();
+        const compact = ans
+            .replace(/[\s,，、/;；·]/g, '')
+            .toUpperCase();
+
+        const out = [];
+        const push = i => {
+            if (i >= 0 && i < count && out.indexOf(i) < 0) {
+                out.push(i);
+            }
+        };
+
+        if (
+            compact &&
+            /^[A-H]+$/.test(compact) &&
+            compact.length <= count
+        ) {
+            compact.split('').forEach(ch =>
+                push(ch.charCodeAt(0) - 65)
+            );
+        }
+
+        if (!out.length) {
+            const m = ans.match(/^[\s（(]*([A-Ha-h])[\s.．、)）]/);
+            if (m) push(m[1].toUpperCase().charCodeAt(0) - 65);
+        }
+
+        if (!out.length) {
+            const ms =
+                ans.match(
+                    /(?:^|[^A-Za-z])([A-H]{1,8})(?![A-Za-z])/g
+                ) || [];
+
+            ms.forEach(tok => {
+                const ch = tok.replace(/[^A-H]/g, '');
+                ch.split('').forEach(c =>
+                    push(c.charCodeAt(0) - 65)
+                );
+            });
+        }
+
+        return out.sort((a, b) => a - b);
+    }
+
+    function matchByText(rawAnswer, options) {
+        const ans = String(rawAnswer || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!ans) return [];
+
+        const norm = s =>
+            String(s)
+                .replace(/^\s*[A-Ha-h]\s*[.．、)]\s*/, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+        const exact = [];
+        (options || []).forEach((opt, i) => {
+            if (norm(opt) === ans) exact.push(i);
+        });
+
+        if (exact.length) return exact;
+
+        const out = [];
+        (options || []).forEach((opt, i) => {
+            const t = norm(opt);
+            if (t && t.length > 3 && ans.indexOf(t) >= 0) {
+                out.push(i);
+            }
+        });
+        return out;
+    }
+
+    function setNativeValue(el, value) {
+        try {
+            el.focus({ preventScroll: true });
+        } catch (e) {}
+
+        let proto = null;
+        if (el.tagName === 'TEXTAREA') {
+            proto =
+                window.HTMLTextAreaElement &&
+                HTMLTextAreaElement.prototype;
+        } else if (el.tagName === 'INPUT') {
+            proto =
+                window.HTMLInputElement &&
+                HTMLInputElement.prototype;
+        }
+
+        const desc = proto
+            ? Object.getOwnPropertyDescriptor(proto, 'value')
+            : null;
+
+        try {
+            if (desc && desc.set) desc.set.call(el, value);
+            else el.value = value;
+        } catch (e) {
+            el.value = value;
+        }
+
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function setChecked(inp, want) {
+        if (inp.checked === want) return true;
+
+        const label = inp.closest('label');
+        try {
+            (label || inp).click();
+        } catch (e) {}
+
+        if (inp.checked !== want) {
+            inp.checked = want;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+
+        return inp.checked === want;
+    }
+
+    function answerLines(raw) {
+        return String(raw || '')
+            .split('\n')
+            .map(s => s.replace(/^\s*\d+\s*[.、)]\s*/, '').trim())
+            .filter(Boolean);
+    }
+
+    function fillAnswer(info, el, rawAnswer) {
+        const res = {
+            filled: 0,
+            total: 0,
+            note: ''
+        };
+
+        if (!el || !info) {
+            res.note = '没有题目元素';
+            return res;
+        }
+
+        const answer = String(rawAnswer || '').trim();
+        if (!answer) {
+            res.note = '答案为空';
+            return res;
+        }
+
+        if (info.type === 'single' || info.type === 'multiple') {
+            const inputs = $all(
+                'input[type=radio],input[type=checkbox]',
+                el
+            );
+            const count = inputs.length;
+
+            if (count >= 2) {
+                res.total = count;
+                let idx = lettersToIndexes(answer, count);
+
+                if (!idx.length) {
+                    idx = matchByText(answer, info.options);
+                }
+
+                if (!idx.length) {
+                    res.note = '没能从答案里认出选项字母';
+                    return res;
+                }
+
+                inputs.forEach((inp, i) => {
+                    const want = idx.indexOf(i) >= 0;
+                    if (want) {
+                        if (setChecked(inp, true)) res.filled++;
+                    } else if (
+                        info.type === 'multiple' &&
+                        inp.checked
+                    ) {
+                        setChecked(inp, false);
+                    }
+                });
+                return res;
+            }
+
+            const blocks = $all(
+                '[class*="option"],[class*="choice"],li',
+                el
+            ).filter(
+                b =>
+                    isVisible(b) &&
+                    b.innerText &&
+                    b.innerText.trim().length < 160
+            );
+
+            if (blocks.length >= 2) {
+                res.total = blocks.length;
+                const picked = lettersToIndexes(answer, blocks.length);
+                const targets = picked.length
+                    ? picked
+                    : matchByText(answer, info.options);
+
+                if (!targets.length) {
+                    res.note = '自定义选项，无法定位正确答案';
+                    return res;
+                }
+
+                targets.forEach(i => {
+                    try {
+                        blocks[i].click();
+                        res.filled++;
+                    } catch (e) {}
+                });
+                return res;
+            }
+
+            res.note = '这道题没有找到选项控件';
+            return res;
+        }
+
+        const boxes = $all(
+            'input[type=text],input:not([type]),textarea',
+            el
+        )
+            .filter(b => isVisible(b))
+            .filter(b => {
+                const t = String(b.type || 'text').toLowerCase();
+                return (
+                    ['text', 'search', 'url', 'email', 'tel'].indexOf(t) >= 0 ||
+                    b.tagName === 'TEXTAREA'
+                );
+            });
+
+        const lines = answerLines(answer);
+
+        if (boxes.length) {
+            res.total = boxes.length;
+            let vals;
+
+            if (info.type === 'blank') {
+                if (lines.length === boxes.length) {
+                    vals = lines;
+                } else {
+                    const flat = lines.join(' ')
+                        .split(/\s+/)
+                        .filter(Boolean);
+
+                    vals = boxes.length === 1
+                        ? [lines.join(' ')]
+                        : (
+                            flat.length === boxes.length
+                                ? flat
+                                : boxes.map(
+                                    (_, i) => lines[i] || flat[i] || ''
+                                )
+                        );
+                }
+            } else {
+                const whole = lines.join('\n');
+                vals = boxes.map((_, i) => (i === 0 ? whole : ''));
+            }
+
+            boxes.forEach((box, i) => {
+                const v = vals[i];
+                if (!v) return;
+                setNativeValue(box, v);
+                if (
+                    String(box.value || '').trim() ===
+                    String(v).trim()
+                ) res.filled++;
+            });
+
+            if (!res.filled) {
+                res.note = '写入后值没变化，页面可能禁止脚本输入';
+            }
+            return res;
+        }
+
+        const ce = el.querySelector(
+            '[contenteditable="true"],[contenteditable=""]'
+        );
+
+        if (ce) {
+            res.total = 1;
+            const whole = lines.join('\n');
+
+            try {
+                ce.focus();
+            } catch (e) {}
+
+            try {
+                const range = document.createRange();
+                range.selectNodeContents(ce);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                document.execCommand('insertText', false, whole);
+            } catch (e) {}
+
+            if (
+                String(ce.innerText || '')
+                    .trim()
+                    .indexOf(whole.slice(0, 20)) < 0
+            ) {
+                ce.textContent = whole;
+                ce.dispatchEvent(
+                    new InputEvent('input', { bubbles: true })
+                );
+            }
+
+            res.filled =
+                String(ce.innerText || '').trim() ? 1 : 0;
+
+            if (!res.filled) res.note = '富文本框写入失败';
+            return res;
+        }
+
+        res.note = '这道题没找到可填写的输入框';
+        return res;
+    }
+
+    /* =====================================================================
+     * 7. iframe 内的静默代理
+     * =================================================================== */
+
+    if (!IS_TOP) {
+        installFrameAgent();
+        return;
+    }
+
+    /* =====================================================================
+     * 8. 界面
+     * =================================================================== */
+
+    const CSS = `
+        :host { all: initial; }
+        * { box-sizing: border-box; }
+
+        .panel {
+            position: fixed;
+            right: 20px;
+            top: 96px;
+            width: 340px;
+            background: #fff;
+            color: #1f2328;
+            border: 1px solid #d0d7de;
+            border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(0,0,0,.18);
+            font: 13px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            z-index: 2147483646;
+        }
+
+        .panel[hidden] { display: none; }
+
+        .hd {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            padding: 8px 10px;
+            background: linear-gradient(135deg,#2563eb,#3b82f6);
+            color: #fff;
+            cursor: move;
+            user-select: none;
+        }
+
+        .hd .t { font-weight: 600; font-size: 13px; }
+        .hd .x {
+            cursor: pointer;
+            padding: 0 4px;
+            font-size: 16px;
+            line-height: 1;
+            opacity: .9;
+        }
+        .hd .x:hover { opacity: 1; }
+
+        .bd {
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .bd[hidden] { display: none; }
+        .row { display: flex; gap: 6px; align-items: center; }
+
+        .chk {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            flex: 1 1 auto;
+            font-size: 12px;
+            color: #374151;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .chk input { margin: 0; cursor: pointer; }
+        .tip { font-size: 11px; color: #9aa4b2; line-height: 1.5; }
+
+        input[type=password],
+        input[type=text],
+        select {
+            flex: 1 1 auto;
+            min-width: 0;
+            padding: 6px 8px;
+            font-size: 12px;
+            border: 1px solid #d0d7de;
+            border-radius: 6px;
+            background: #fff;
+            color: #1f2328;
+        }
+
+        input:focus, select:focus {
+            outline: 2px solid #93c5fd;
+            outline-offset: -1px;
+        }
+
+        button {
+            padding: 7px 10px;
+            font-size: 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            border: 1px solid transparent;
+            background: #2563eb;
+            color: #fff;
+            font-family: inherit;
+        }
+
+        button:hover:not(:disabled) { background: #1d4ed8; }
+        button:disabled {
+            background: #c9ced6;
+            cursor: not-allowed;
+        }
+
+        button.ghost {
+            background: #fff;
+            color: #374151;
+            border-color: #d0d7de;
+        }
+
+        button.ghost:hover:not(:disabled) {
+            background: #f3f4f6;
+        }
+
+        button.primary {
+            flex: 1 1 auto;
+            padding: 9px 10px;
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .ans {
+            min-height: 64px;
+            max-height: 38vh;
+            overflow: auto;
+            background: #f6f8fa;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 8px 10px;
+            font-size: 13px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: normal;
+            user-select: text;
+            cursor: text;
+        }
+
+        .ans.empty { color: #9aa4b2; }
+        .st { font-size: 11px; color: #8a94a6; min-height: 14px; }
+        .st.warn { color: #b45309; }
+        .st.err { color: #b91c1c; }
+        .st.ok { color: #15803d; }
+
+        details { font-size: 11px; color: #6b7280; }
+        summary { cursor: pointer; user-select: none; }
+
+        details pre {
+            margin: 6px 0 0;
+            padding: 6px;
+            max-height: 120px;
+            overflow: auto;
+            background: #fafbfc;
+            border: 1px dashed #d8dee4;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-size: 11px;
+        }
+
+        .ball {
+            position: fixed;
+            right: 20px;
+            top: 96px;
+            width: 44px;
+            height: 44px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #2563eb;
+            color: #fff;
+            font-size: 18px;
+            cursor: pointer;
+            box-shadow: 0 6px 18px rgba(37,99,235,.45);
+            z-index: 2147483646;
+            user-select: none;
+        }
+
+        .ball[hidden] { display: none; }
+    `;
+
+    const HTML = `
+        <div class="panel" id="panel">
+            <div class="hd" id="hd">
+                <span class="t">🤖 U校园 AI 答题助手 · Groq</span>
+                <span class="x" id="btn-min" title="收起为悬浮球">—</span>
+            </div>
+
+            <div class="bd" id="bd">
+                <div class="row">
+                    <input
+                        type="password"
+                        id="key"
+                        placeholder="Groq API Key（仅存本机）"
+                        autocomplete="off"
+                        spellcheck="false"
+                    >
+                    <button class="ghost" id="btn-save">保存</button>
+                </div>
+
+                <div class="row">
+                    <select id="model"></select>
+                    <button class="ghost" id="btn-copy" title="复制答案">复制</button>
+                </div>
+
+                <div class="row">
+                    <label class="chk">
+                        <input type="checkbox" id="autofill">
+                        取到答案后自动填入
+                    </label>
+                    <button
+                        class="ghost"
+                        id="btn-fill"
+                        disabled
+                        title="把已获得的答案填进页面（Alt+F）"
+                    >填入答案</button>
+                </div>
+
+                <div class="row">
+                    <button class="primary" id="btn-ask">
+                        获取当前题目答案
+                    </button>
+                    <button class="ghost" id="btn-pause" disabled>
+                        暂停程序
+                    </button>
+                </div>
+
+                <div class="ans empty" id="ans">
+                    答案将显示在这里…
+                </div>
+
+                <div class="st" id="st"></div>
+
+                <div class="tip">
+                    自动填入开启后，将依次填入、提交并继续下一题。
+                </div>
+
+                <details id="preview" hidden>
+                    <summary>查看发送给模型的题目</summary>
+                    <pre id="preview-pre"></pre>
+                </details>
+            </div>
+        </div>
+
+        <div class="ball" id="ball" hidden>🤖</div>
+    `;
+
+    function byId(root, id) {
+        return (
+            root.querySelector &&
+            root.querySelector('#' + id)
+        ) || null;
+    }
+
+    const hostEl = document.createElement('div');
+    hostEl.id = 'ucampus-ai-helper-host';
+    hostEl.style.cssText =
+        'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483646;';
+
+    const shadow = hostEl.attachShadow
+        ? hostEl.attachShadow({ mode: 'open' })
+        : hostEl;
+
+    shadow.innerHTML = '<style>' + CSS + '</style>' + HTML;
+
+    (document.body || document.documentElement)
+        .appendChild(hostEl);
+
+    const ui = {
+        panel: byId(shadow, 'panel'),
+        bd: byId(shadow, 'bd'),
+        ball: byId(shadow, 'ball'),
+        hd: byId(shadow, 'hd'),
+        key: byId(shadow, 'key'),
+        model: byId(shadow, 'model'),
+        ans: byId(shadow, 'ans'),
+        st: byId(shadow, 'st'),
+        preview: byId(shadow, 'preview'),
+        previewPre: byId(shadow, 'preview-pre'),
+        btnAsk: byId(shadow, 'btn-ask'),
+        btnSave: byId(shadow, 'btn-save'),
+        btnCopy: byId(shadow, 'btn-copy'),
+        btnFill: byId(shadow, 'btn-fill'),
+        btnPause: byId(shadow, 'btn-pause'),
+        autofill: byId(shadow, 'autofill'),
+        btnMin: byId(shadow, 'btn-min'),
+    };
+
+    /* =====================================================================
+     * 9. 状态与展示
+     * =================================================================== */
+
+    let busy = false;
+
+    // 新增：暂停状态
+    let paused = false;
+
+    let lastQ = null;
+    let lastA = '';
+
+    function setStatus(msg, kind) {
+        ui.st.textContent = msg || '';
+        ui.st.className = 'st' + (kind ? ' ' + kind : '');
+    }
+
+    function setAnswer(text, empty) {
+        ui.ans.textContent = text;
+        if (empty) {
+            ui.ans.classList.add('empty');
+        } else {
+            ui.ans.classList.remove('empty');
+        }
+    }
+
+    function showPreview(q) {
+        if (!q || !q.text) {
+            ui.preview.hidden = true;
+            return;
+        }
+
+        const typeName = {
+            single: '单选题',
+            multiple: '多选题',
+            judge: '判断题',
+            blank: '填空题',
+            translate: '翻译/写作',
+        }[q.type] || q.type;
+
+        ui.previewPre.textContent =
+            '【识别题型】' +
+            typeName +
+            (q.blanks ? '（' + q.blanks + ' 空）' : '') +
+            '\n\n' +
+            q.text;
+
+        ui.preview.hidden = false;
+    }
+
+    function setBusy(on) {
+        busy = on;
+        ui.btnAsk.disabled = on;
+        ui.btnPause.disabled = !on;
+
+        if (!on) {
+            paused = false;
+            ui.btnPause.textContent = '暂停程序';
+        }
+
+        ui.btnAsk.textContent = on
+            ? '答题循环中…'
+            : '获取当前题目答案';
+    }
+
+    // 新增：暂停时等待，继续后再往下执行
+    async function waitIfPaused() {
+        while (paused) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+        }
+    }
+
+    // 新增：暂停按钮
+    ui.btnPause.addEventListener('click', () => {
+        if (!busy) return;
+
+        paused = !paused;
+
+        if (paused) {
+            ui.btnPause.textContent = '继续程序';
+            setStatus('程序已暂停，点击“继续程序”恢复', 'warn');
+        } else {
+            ui.btnPause.textContent = '暂停程序';
+            setStatus('程序已恢复运行', 'ok');
+        }
+    });
+
+    /* =====================================================================
+     * 10. 拖拽
+     * =================================================================== */
+
+    (function enableDrag() {
+        let sx = 0;
+        let sy = 0;
+        let ox = 0;
+        let oy = 0;
+        let dragging = false;
+
+        const start = e => {
+            if (e.target && e.target.id === 'btn-min') return;
+
+            dragging = true;
+            const r = ui.panel.getBoundingClientRect();
+
+            ox = r.left;
+            oy = r.top;
+            sx = e.clientX;
+            sy = e.clientY;
+
+            ui.panel.style.right = 'auto';
+            ui.panel.style.left = ox + 'px';
+            ui.panel.style.top = oy + 'px';
+
+            e.preventDefault();
+        };
+
+        const move = e => {
+            if (!dragging) return;
+
+            let x = ox + e.clientX - sx;
+            let y = oy + e.clientY - sy;
+
+            const w = ui.panel.offsetWidth;
+            const h = ui.panel.offsetHeight;
+
+            x = Math.max(
+                4,
+                Math.min(x, (window.innerWidth || 0) - w - 4)
+            );
+
+            y = Math.max(
+                4,
+                Math.min(y, (window.innerHeight || 0) - h - 4)
+            );
+
+            ui.panel.style.left = x + 'px';
+            ui.panel.style.top = y + 'px';
+        };
+
+        const end = () => {
+            if (!dragging) return;
+            dragging = false;
+
+            store.set(CFG.POS_STORE, {
+                left: parseInt(ui.panel.style.left, 10) || 0,
+                top: parseInt(ui.panel.style.top, 10) || 0,
+            });
+        };
+
+        ui.hd.addEventListener('mousedown', start);
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', end);
+
+        const pos = store.get(CFG.POS_STORE, null);
+        if (pos && typeof pos.left === 'number') {
+            ui.panel.style.right = 'auto';
+            ui.panel.style.left = pos.left + 'px';
+            ui.panel.style.top = pos.top + 'px';
+        }
+    })();
+
+    /* =====================================================================
+     * 11. 收起 / 展开
+     * =================================================================== */
+
+    function minimize() {
+        const r = ui.panel.getBoundingClientRect();
+        ui.panel.hidden = true;
+        ui.ball.hidden = false;
+        ui.ball.style.right = 'auto';
+        ui.ball.style.left = Math.max(4, r.left) + 'px';
+        ui.ball.style.top =
+            Math.max(
+                4,
+                Math.min(r.top, (window.innerHeight || 0) - 48)
+            ) + 'px';
+    }
+
+    function expand() {
+        ui.panel.hidden = false;
+        ui.ball.hidden = true;
+    }
+
+    ui.btnMin.addEventListener('click', e => {
+        e.stopPropagation();
+        minimize();
+    });
+
+    ui.ball.addEventListener('click', expand);
+
+    /* =====================================================================
+     * 12. 初始化控件
+     * =================================================================== */
+
+    CFG.models.forEach(m => {
+        const o = document.createElement('option');
+        o.value = m;
+        o.textContent = m;
+        ui.model.appendChild(o);
+    });
+
+    ui.model.value = getModel();
+
+    ui.model.addEventListener('change', () => {
+        store.set(CFG.MODEL_STORE, ui.model.value);
+    });
+
+    ui.autofill.checked =
+        store.get(CFG.AUTOFILL_STORE, true) !== false;
+
+    ui.autofill.addEventListener('change', () => {
+        store.set(CFG.AUTOFILL_STORE, ui.autofill.checked);
+    });
+
+    const autoFillOn = () => !!ui.autofill.checked;
+
+    const savedKey = getKey();
+    if (savedKey) ui.key.value = savedKey;
+
+    function saveKey() {
+        const v = String(ui.key.value || '').trim();
+
+        if (!v) {
+            setStatus('Key 不能为空', 'warn');
+            return;
+        }
+
+        if (!/^gsk_[A-Za-z0-9_-]{16,}$/.test(v)) {
+            setStatus(
+                'Groq Key 格式可能不正确，请检查是否以 gsk_ 开头',
+                'warn'
+            );
+        } else {
+            setStatus('Groq API Key 已保存到本机', 'ok');
+        }
+
+        store.set(CFG.KEY_STORE, v);
+    }
+
+    ui.btnSave.addEventListener('click', saveKey);
+
+    ui.key.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            saveKey();
+        }
+    });
+
+    /* =====================================================================
+     * 13. 复制答案
+     * =================================================================== */
+
+    async function copyAnswer() {
+        const text = ui.ans.textContent || '';
+
+        if (!text || ui.ans.classList.contains('empty')) {
+            setStatus('还没有可复制的答案', 'warn');
+            return;
+        }
+
+        try {
+            await navigator.clipboard.writeText(text);
+            setStatus('已复制到剪贴板', 'ok');
+            return;
+        } catch (e) {}
+
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;left:-9999px;top:0;';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            setStatus('已复制到剪贴板', 'ok');
+        } catch (e) {
+            setStatus('复制失败，请手动选中文字复制', 'err');
+        }
+    }
+
+    ui.btnCopy.addEventListener('click', copyAnswer);
+
+    /* =====================================================================
+     * 14. 自动填入
+     * =================================================================== */
+
+    function fillMessage(r) {
+        if (!r) {
+            return '答案已返回，但填入超时，请手动选择';
+        }
+
+        if (!r.total) {
+            return '答案已返回；这道题没找到可填控件，请手动作答';
+        }
+
+        if (!r.filled) {
+            return (
+                '答案已返回，但没能填入（' +
+                (r.note || '控件结构不匹配') +
+                '）'
+            );
+        }
+
+        return (
+            '已自动填入 ' +
+            r.filled +
+            ' / ' +
+            r.total +
+            ' 处，请核对后手动提交'
+        );
+    }
+
+    async function doFill() {
+        if (!lastQ || !lastA) {
+            setStatus('请先获取答案', 'warn');
+            return;
+        }
+
+        ui.btnFill.disabled = true;
+        setStatus('正在填入…');
+
+        try {
+            const r = await applyAnswer(lastQ, lastA);
+            setStatus(
+                fillMessage(r),
+                r && r.filled > 0 ? 'ok' : 'warn'
+            );
+        } catch (e) {
+            setStatus(
+                '填入失败：' + ((e && e.message) || e),
+                'err'
+            );
+        } finally {
+            ui.btnFill.disabled = false;
+        }
+    }
+
+    ui.btnFill.addEventListener('click', doFill);
+
+    /* =====================================================================
+     * 15. 自动提交与继续循环
+     * =================================================================== */
+
+    function normalizeCampusButtonText(text) {
+        return String(text || '')
+            .replace(/\s+/g, '')
+            .replace(/[：:！!。]/g, '')
+            .trim();
+    }
+
+    function findCampusButton(type) {
+        const selectors = [
+            'button',
+            'input[type="button"]',
+            'input[type="submit"]',
+            '[role="button"]',
+            'a'
+        ];
+
+        const names = type === 'submit'
+            ? ['提交', '提交答案', '确认提交']
+            : ['继续', '下一题', '继续学习', '继续答题', '进入下一题'];
+
+        const candidates = [];
+
+        selectors.forEach(selector => {
+            document.querySelectorAll(selector).forEach(el => {
+                if (!isVisible(el)) return;
+
+                if (
+                    el.disabled ||
+                    el.getAttribute('aria-disabled') === 'true'
+                ) return;
+
+                const text = normalizeCampusButtonText(
+                    el.tagName === 'INPUT'
+                        ? el.value
+                        : el.innerText || el.textContent
+                );
+
+                if (!names.includes(text)) return;
+                if (!candidates.includes(el)) candidates.push(el);
+            });
+        });
+
+        const realButtons = candidates.filter(el =>
+            el.matches(
+                'button,input[type="button"],input[type="submit"]'
+            )
+        );
+
+        if (realButtons.length === 1) return realButtons[0];
+        if (realButtons.length > 1) return null;
+
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    function waitCampusButton(type, timeout = 20000) {
+        return new Promise(resolve => {
+            const start = Date.now();
+
+            const timer = setInterval(() => {
+                const button = findCampusButton(type);
+
+                if (button) {
+                    clearInterval(timer);
+                    resolve(button);
+                    return;
+                }
+
+                if (Date.now() - start >= timeout) {
+                    clearInterval(timer);
+                    resolve(null);
+                }
+            }, 300);
+        });
+    }
+
+    async function waitNextCampusQuestion(oldText, timeout = 20000) {
+        const start = Date.now();
+        const oldSignature = hash(cleanText(oldText));
+
+        while (Date.now() - start < timeout) {
+            await new Promise(resolve => setTimeout(resolve, 700));
+
+            const q = await extractQuestion();
+            if (!q || !q.text) continue;
+
+            const newSignature = hash(cleanText(q.text));
+            if (newSignature !== oldSignature) return q;
+        }
+
+        return null;
+    }
+
+    async function onAsk() {
+        if (busy) return;
+
+        const key =
+            getKey() ||
+            String(ui.key.value || '').trim();
+
+        if (!key) {
+            setStatus('请先填写 Groq API Key 并保存', 'warn');
+            ui.key.focus();
+            return;
+        }
+
+        if (key !== getKey()) {
+            store.set(CFG.KEY_STORE, key);
+        }
+
+        setBusy(true);
+
+        try {
+            let questionCount = 0;
+
+            while (true) {
+                // 每轮开始前检查暂停状态
+                await waitIfPaused();
+
+                questionCount++;
+
+                setStatus('正在提取第 ' + questionCount + ' 道题…');
+
+                const q = await extractQuestion();
+
+                // 提取过程中如果按下暂停，在这里停住
+                await waitIfPaused();
+
+                if (!q || !q.text || q.text.length < 8) {
+                    setStatus('没有识别到题目，答题循环结束', 'warn');
+                    showPreview(null);
+                    break;
+                }
+
+                showPreview(q);
+
+                setStatus('已识别题目，正在请求 ' + getModel() + '…');
+                setAnswer('请求中…', true);
+
+                const answer = await getAnswer(q);
+
+                // AI 请求结束后检查暂停状态
+                await waitIfPaused();
+
+                if (!answer) {
+                    setAnswer('模型没有返回答案', true);
+                    setStatus('没有获取到答案，循环结束', 'err');
+                    break;
+                }
+
+                setAnswer(answer, false);
+                lastQ = q;
+                lastA = answer;
+                ui.btnFill.disabled = false;
+
+                if (!autoFillOn()) {
+                    setStatus('答案已获取，自动填入未开启', 'ok');
+                    break;
+                }
+
+                await waitIfPaused();
+
+                setStatus('答案已获取，正在填入…');
+
+                let result = null;
+
+                try {
+                    result = await applyAnswer(q, answer);
+                } catch (e) {
+                    result = null;
+                }
+
+                // 填入完成后检查暂停状态
+                await waitIfPaused();
+
+                if (!result || !result.total || !result.filled) {
+                    setStatus(
+                        '答案填入失败：' +
+                        (
+                            result && result.note
+                                ? result.note
+                                : '没有成功填入答案'
+                        ) +
+                        '，停止循环',
+                        'err'
+                    );
+                    break;
+                }
+
+                setStatus(
+                    '已填入 ' +
+                    result.filled +
+                    ' / ' +
+                    result.total +
+                    '，准备提交…',
+                    'ok'
+                );
+
+                await new Promise(resolve => setTimeout(resolve, 800));
+                await waitIfPaused();
+
+                const submitButton = await waitCampusButton(
+                    'submit',
+                    20000
+                );
+
+                await waitIfPaused();
+
+                if (!submitButton) {
+                    setStatus('没有找到唯一的提交按钮，循环结束', 'warn');
+                    break;
+                }
+
+                // 点击提交前再次确认没有暂停
+                await waitIfPaused();
+                submitButton.click();
+
+                setStatus('已提交，等待判题结果…');
+
+                const continueButton = await waitCampusButton(
+                    'continue',
+                    20000
+                );
+
+                await waitIfPaused();
+
+                if (!continueButton) {
+                    setStatus('没有找到继续按钮，循环结束', 'warn');
+                    break;
+                }
+
+                const previousQuestionText = q.text;
+
+                // 点击继续前再次确认没有暂停
+                await waitIfPaused();
+                continueButton.click();
+
+                setStatus('已点击继续，正在等待下一题…');
+
+                const nextQuestion = await waitNextCampusQuestion(
+                    previousQuestionText,
+                    20000
+                );
+
+                await waitIfPaused();
+
+                if (!nextQuestion) {
+                    setStatus('没有检测到新的题目，答题循环结束', 'ok');
+                    break;
+                }
+            }
+
+        } catch (err) {
+            const msg =
+                err && err.message
+                    ? err.message
+                    : String(err);
+
+            setAnswer('❌ ' + msg, true);
+            setStatus(msg, 'err');
+
+        } finally {
+            setBusy(false);
+        }
+    }
+
+    ui.btnAsk.addEventListener('click', onAsk);
+
+    /* =====================================================================
+     * 16. 快捷键
+     * =================================================================== */
+
+    window.addEventListener('keydown', e => {
+        if (!e.altKey || e.ctrlKey || e.metaKey) return;
+
+        const k = (e.key || '').toLowerCase();
+
+        if (k === 'q') {
+            e.preventDefault();
+            onAsk();
+        } else if (k === 'f') {
+            e.preventDefault();
+            doFill();
+        } else if (k === 'm') {
+            e.preventDefault();
+            ui.panel.hidden ? expand() : minimize();
+        }
+    });
+
+    /* =====================================================================
+     * 17. 启动
+     * =================================================================== */
+
+    if (!getKey()) {
+        setStatus('首次使用：填写 Groq API Key 后点击保存', 'warn');
+    } else {
+        setStatus('Groq 已就绪 · Alt+Q 获取答案', null);
+    }
+
+})();
