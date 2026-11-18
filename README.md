@@ -53,6 +53,7 @@ U校园 AI 答题助手脚本| 实现自动识别和答题
 2. 安装答题脚本
 
 1. 打开 Tampermonkey 管理面板。
+https://www.tampermonkey.net/?utm_source=chatgpt.com
 2. 点击添加新脚本。
 3. 删除编辑器中的默认代码。
 4. 将完整的 U校园 AI 答题助手代码复制进去。
@@ -64,6 +65,7 @@ U校园 AI 答题助手脚本| 实现自动识别和答题
 3. 配置 Groq API Key
 
 首次使用需要配置 Groq API Key。
+https://groq.com/?utm_source=chatgpt.com
 
 1. 获取自己的 Groq API Key。
 2. 打开 U校园答题助手面板。
